@@ -1,0 +1,14 @@
+{
+  "name": "dash-dot",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/app": "^8.0.0",
+    "@capacitor/core": "^8.5.0",
+    "@capacitor-community/admob": "^8.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.0"
+  }
+}
