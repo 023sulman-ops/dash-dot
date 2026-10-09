@@ -1,0 +1,140 @@
+name: Release (Play Store file)
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "make-key = ONE time only. build-release = makes the file for Play Store"
+        type: choice
+        options:
+          - make-key
+          - build-release
+
+jobs:
+  make-key:
+    if: ${{ inputs.task == 'make-key' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Create the upload key
+        env:
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEY_PASSWORD" ]; then echo "ERROR: first create the secret KEY_PASSWORD (Settings > Secrets and variables > Actions)"; exit 1; fi
+          if [ -f upload-keystore.jks.gpg ]; then echo "ERROR: a key already exists. Do not make a second one."; exit 1; fi
+          keytool -genkeypair -storetype PKCS12 -keystore upload-keystore.jks -alias upload -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KEY_PASSWORD" -keypass "$KEY_PASSWORD" -dname "CN=Muhammad Suleman, OU=Dash Dot, O=Dash Dot, L=Multan, ST=Punjab, C=PK"
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$KEY_PASSWORD" --symmetric --cipher-algo AES256 -o upload-keystore.jks.gpg upload-keystore.jks
+          rm upload-keystore.jks
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add upload-keystore.jks.gpg
+          git commit -m "Add encrypted upload key"
+          git push
+          echo "DONE: the encrypted key was saved in your repository."
+
+  release:
+    if: ${{ inputs.task == 'build-release' }}
+    runs-on: ubuntu-24.04
+    env:
+      ADS_MODE: real
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+
+      - name: Install packages
+        run: |
+          npm install
+          npm install --no-save @fontsource/fredoka || true
+
+      - name: Use newest game file and set AdMob ids
+        run: |
+          cp "$(ls dash-dot-v*.html | sort -V | tail -1)" dash-dot.html
+          python3 - <<'PYADS'
+          p='dash-dot.html'
+          s=open(p).read()
+          s=s.replace('test:true','test:false',1)
+          for a,b in [('3940256099942544/6300978111','1396927294684415/3441804487'),('3940256099942544/1033173712','1396927294684415/6709208067'),('3940256099942544/5224354917','1396927294684415/1906553502')]:
+              assert a in s
+              s=s.replace(a,b,1)
+          open(p,'w').write(s)
+          print('REAL ads ids applied')
+          PYADS
+
+      - name: Prepare web files
+        run: node setup.js web
+
+      - name: Create Android project
+        run: npx cap add android
+
+      - name: Patch Android project
+        env:
+          ADMOB_APP_ID: ca-app-pub-1396927294684415~3919393196
+        run: node setup.js android
+
+      - name: Version number and signing
+        env:
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          N: ${{ github.run_number }}
+        run: |
+          if [ -z "$KEY_PASSWORD" ]; then echo "ERROR: secret KEY_PASSWORD is missing"; exit 1; fi
+          if [ ! -f upload-keystore.jks.gpg ]; then echo "ERROR: run make-key first"; exit 1; fi
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$KEY_PASSWORD" -o android/upload-keystore.jks -d upload-keystore.jks.gpg
+          G=android/app/build.gradle
+          sed -i -E "s/versionCode *=? *[0-9]+/versionCode $N/; s/versionName *=? *\"[^\"]*\"/versionName \"1.0.$N\"/" $G
+          grep -q "versionCode $N" $G || { echo "ERROR: could not set the version"; exit 1; }
+          cat >> $G <<'GRADLE'
+
+          android {
+              signingConfigs {
+                  release {
+                      storeFile = file(System.getenv("KS_FILE"))
+                      storePassword = System.getenv("KS_PASS")
+                      keyAlias = "upload"
+                      keyPassword = System.getenv("KS_PASS")
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig = signingConfigs.release
+                  }
+              }
+          }
+          GRADLE
+
+      - name: Sync
+        run: npx cap sync android
+
+      - name: Build the Play Store file (.aab)
+        env:
+          KS_FILE: ${{ github.workspace }}/android/upload-keystore.jks
+          KS_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew bundleRelease
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: DashDot-release-aab
+          path: android/app/build/outputs/bundle/release/app-release.aab
